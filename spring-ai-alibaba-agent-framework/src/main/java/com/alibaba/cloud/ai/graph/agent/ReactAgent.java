@@ -88,9 +88,11 @@ import static com.alibaba.cloud.ai.graph.StateGraph.START;
 import static com.alibaba.cloud.ai.graph.action.AsyncEdgeAction.edge_async;
 import static com.alibaba.cloud.ai.graph.action.AsyncNodeActionWithConfig.node_async;
 import static com.alibaba.cloud.ai.graph.agent.hook.InterruptionHook.INTERRUPTION_FEEDBACK_KEY;
+import static com.alibaba.cloud.ai.graph.agent.hook.returndirect.ReturnDirectConstants.FINISH_REASON_METADATA_KEY;
 import static com.alibaba.cloud.ai.graph.internal.node.ResumableSubGraphAction.resumeSubGraphId;
 import static com.alibaba.cloud.ai.graph.internal.node.ResumableSubGraphAction.subGraphId;
 import static java.lang.String.format;
+import static org.springframework.ai.model.tool.ToolExecutionResult.FINISH_REASON;
 
 
 public class ReactAgent extends BaseAgent {
@@ -273,15 +275,98 @@ public class ReactAgent extends BaseAgent {
 					.orElseThrow(() -> new IllegalStateException("Output key " + outputKey + " not found in agent state"));
 		}
 
-		// Add a validation instance when performing message conversion to
-		// avoid potential type conversion exceptions.
-		return state.flatMap(s -> s.value("messages"))
-				.stream()
-				.flatMap(messageList -> ((List<?>) messageList).stream()
-						.filter(msg -> msg instanceof AssistantMessage)
-						.map(msg -> (AssistantMessage) msg))
+		List<Message> messages = state.flatMap(s -> s.value("messages"))
+				.map(messageList -> ((List<?>) messageList).stream()
+						.filter(Message.class::isInstance)
+						.map(Message.class::cast)
+						.toList())
+				.orElseThrow(() -> new AgentException("No 'messages' state found"));
+
+		if (!messages.isEmpty()) {
+			Message lastMessage = messages.get(messages.size() - 1);
+			if (lastMessage instanceof ToolResponseMessage toolResponseMessage
+					&& FINISH_REASON.equals(toolResponseMessage.getMetadata().get(FINISH_REASON_METADATA_KEY))) {
+				return AssistantMessage.builder()
+						.content(generateReturnDirectAssistantText(toolResponseMessage))
+						.build();
+			}
+		}
+
+		return messages.stream()
+				.filter(AssistantMessage.class::isInstance)
+				.map(AssistantMessage.class::cast)
 				.reduce((first, second) -> second)
 				.orElseThrow(() -> new AgentException("No AssistantMessage found in 'messages' state"));
+	}
+
+	private String generateReturnDirectAssistantText(ToolResponseMessage toolResponseMessage) {
+		List<ToolResponseMessage.ToolResponse> responses = toolResponseMessage.getResponses();
+		if (responses.isEmpty()) {
+			return "";
+		}
+		if (responses.size() == 1) {
+			return Objects.requireNonNullElse(responses.get(0).responseData(), "");
+		}
+
+		StringBuilder jsonArray = new StringBuilder("[");
+		for (int i = 0; i < responses.size(); i++) {
+			if (i > 0) {
+				jsonArray.append(",");
+			}
+			String responseData = responses.get(i).responseData();
+			if (responseData == null) {
+				jsonArray.append("null");
+			}
+			else {
+				String trimmed = responseData.trim();
+				if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+					jsonArray.append(responseData);
+				}
+				else {
+					jsonArray.append("\"").append(escapeJsonString(responseData)).append("\"");
+				}
+			}
+		}
+		jsonArray.append("]");
+		return jsonArray.toString();
+	}
+
+	private String escapeJsonString(String str) {
+		StringBuilder sb = new StringBuilder();
+		for (char c : str.toCharArray()) {
+			switch (c) {
+				case '"':
+					sb.append("\\\"");
+					break;
+				case '\\':
+					sb.append("\\\\");
+					break;
+				case '\b':
+					sb.append("\\b");
+					break;
+				case '\f':
+					sb.append("\\f");
+					break;
+				case '\n':
+					sb.append("\\n");
+					break;
+				case '\r':
+					sb.append("\\r");
+					break;
+				case '\t':
+					sb.append("\\t");
+					break;
+				default:
+					if (c < 0x20) {
+						sb.append(String.format("\\u%04x", (int) c));
+					}
+					else {
+						sb.append(c);
+					}
+					break;
+			}
+		}
+		return sb.toString();
 	}
 
 	public StateGraph getStateGraph() {
@@ -827,22 +912,15 @@ public class ReactAgent extends BaseAgent {
 
 	private EdgeAction makeToolsToModelEdge(String modelDestination, String endDestination) {
 		return state -> {
-			// 1. Extract last AI message and corresponding tool messages
+			// AgentToolNode already computed the all-tools-returnDirect condition and
+			// persisted it in ToolResponseMessage metadata. Reuse that signal here so
+			// the default ReactAgent loop can short-circuit without requiring hooks.
 			ToolResponseMessage toolResponseMessage = fetchLastToolResponseMessage(state);
-			// 2. Exit condition: All executed tools have return_direct=True
-			if (toolResponseMessage != null && !toolResponseMessage.getResponses().isEmpty()) {
-				boolean allReturnDirect = toolResponseMessage.getResponses().stream().allMatch(toolResponse -> {
-					String toolName = toolResponse.name();
-					return false; // FIXME
-				});
-				if (allReturnDirect) {
-					return endDestination;
-				}
+			if (toolResponseMessage != null && FINISH_REASON.equals(toolResponseMessage.getMetadata().get(FINISH_REASON_METADATA_KEY))) {
+				return endDestination;
 			}
 
-			// 3. Default: Continue the loop
-			//    Tool execution completed successfully, route back to the model
-			//    so it can process the tool results and decide the next action.
+			// Default: continue the loop so the model can consume the tool results.
 			return modelDestination;
 		};
 	}

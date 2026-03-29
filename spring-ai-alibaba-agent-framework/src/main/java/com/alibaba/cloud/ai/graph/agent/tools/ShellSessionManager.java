@@ -50,6 +50,7 @@ public class ShellSessionManager {
 	private final List<String> shellCommand;
 	private final Map<String, String> environment;
 	private final List<RedactionRule> redactionRules;
+	private final ConcurrentMap<String, ManagedShellSession> trackedSessions = new ConcurrentHashMap<>();
 
 	private ShellSessionManager(Builder builder) {
 		this.workspaceRoot = builder.workspaceRoot;
@@ -74,12 +75,19 @@ public class ShellSessionManager {
 	 * Initialize shell session.
 	 */
 	public void initialize(RunnableConfig config) {
+		ManagedShellSession existingSession = resolveManagedSession(config);
+		if (existingSession != null && existingSession.isAlive()) {
+			log.info("Reusing shell session for thread: {}", config.threadId().orElse("<no-thread-id>"));
+			attachToContext(config, existingSession);
+			return;
+		}
+
 		try {
 			Path workspace = workspaceRoot;
+			Path sessionPath = null;
 			if (useTemporaryWorkspace) {
 				Path tempDir = Files.createTempDirectory("shell_tool_");
-				config.context().put(SESSION_PATH_CONTEXT_KEY, tempDir);
-
+				sessionPath = tempDir;
 				workspace = tempDir;
 			} else {
 				Files.createDirectories(workspace);
@@ -87,7 +95,9 @@ public class ShellSessionManager {
 
 			ShellSession session = new ShellSession(workspace, shellCommand, environment);
 			session.start();
-			config.context().put(SESSION_INSTANCE_CONTEXT_KEY, session);
+			ManagedShellSession managedSession = new ManagedShellSession(session, sessionPath);
+			attachToContext(config, managedSession);
+			trackSession(config, managedSession);
 
 			log.info("Started shell session in workspace: {}", workspace);
 
@@ -108,38 +118,47 @@ public class ShellSessionManager {
 	 * Clean up shell session.
 	 */
 	public void cleanup(RunnableConfig config) {
+		ManagedShellSession managedSession = resolveManagedSession(config);
 		try {
-			ShellSession session = (ShellSession) config.context().get(SESSION_INSTANCE_CONTEXT_KEY);
-			if (session != null) {
+			if (managedSession != null && managedSession.session() != null) {
 				// Run shutdown commands
 				for (String command : shutdownCommands) {
 					try {
-						session.execute(command, commandTimeout, maxOutputLines, maxOutputBytes);
+						managedSession.session().execute(command, commandTimeout, maxOutputLines, maxOutputBytes);
 					} catch (Exception e) {
 						log.warn("Shutdown command failed: {}", command, e);
 					}
 				}
 			}
 		} finally {
-			doCleanup(config);
+			doCleanup(config, managedSession);
 		}
 	}
 
-	private void doCleanup(RunnableConfig config) {
-		ShellSession session = (ShellSession) config.context().get(SESSION_INSTANCE_CONTEXT_KEY);
-		if (session != null) {
-			session.stop(terminationTimeout);
-			config.context().remove(SESSION_INSTANCE_CONTEXT_KEY);
+	private void doCleanup(RunnableConfig config, ManagedShellSession managedSession) {
+		ManagedShellSession contextSession = sessionFromContext(config);
+		ManagedShellSession trackedSession = trackedSession(config);
+
+		Set<ShellSession> cleanedSessions = Collections.newSetFromMap(new IdentityHashMap<>());
+		List<ManagedShellSession> sessionsToCleanup = new ArrayList<>();
+		if (managedSession != null) {
+			sessionsToCleanup.add(managedSession);
+		}
+		if (contextSession != null) {
+			sessionsToCleanup.add(contextSession);
+		}
+		if (trackedSession != null) {
+			sessionsToCleanup.add(trackedSession);
 		}
 
-		Path tempDir = (Path) config.context().get(SESSION_PATH_CONTEXT_KEY);
-		if (tempDir != null) {
-			try {
-				deleteDirectory(tempDir);
-			} catch (IOException e) {
-				log.warn("Failed to delete temporary directory: {}", tempDir, e);
+		clearContext(config);
+
+		for (ManagedShellSession candidate : sessionsToCleanup) {
+			if (candidate == null || candidate.session() == null || !cleanedSessions.add(candidate.session())) {
+				continue;
 			}
-			config.context().remove(SESSION_PATH_CONTEXT_KEY);
+			removeTrackedSession(config, candidate);
+			cleanupManagedSession(candidate);
 		}
 	}
 
@@ -147,13 +166,13 @@ public class ShellSessionManager {
 	 * Execute a command in the current shell session.
 	 */
 	public CommandResult executeCommand(String command, RunnableConfig config) {
-		ShellSession session = (ShellSession) config.context().get(SESSION_INSTANCE_CONTEXT_KEY);
-		if (session == null) {
+		ManagedShellSession managedSession = resolveManagedSession(config);
+		if (managedSession == null || managedSession.session() == null) {
 			throw new IllegalStateException("Shell session not initialized. Call initialize() first, you might need to enable ShellToolAgentHook to enable shell session management.");
 		}
 
 		log.info("Executing shell command: {}", command);
-		CommandResult result = session.execute(command, commandTimeout, maxOutputLines, maxOutputBytes);
+		CommandResult result = managedSession.session().execute(command, commandTimeout, maxOutputLines, maxOutputBytes);
 
 		// Apply redactions and track matches
 		String output = result.getOutput();
@@ -177,17 +196,97 @@ public class ShellSessionManager {
 	 * Restart the shell session.
 	 */
 	public void restartSession(RunnableConfig config) {
-		ShellSession session = (ShellSession) config.context().get(SESSION_INSTANCE_CONTEXT_KEY);
-		if (session == null) {
+		ManagedShellSession managedSession = resolveManagedSession(config);
+		if (managedSession == null || managedSession.session() == null) {
 			throw new IllegalStateException("Shell session not initialized.");
 		}
 
 		log.info("Restarting shell session");
-		session.restart();
+		managedSession.session().restart();
 
 		// Re-run startup commands
 		for (String command : startupCommands) {
-			session.execute(command, startupTimeout, maxOutputLines, maxOutputBytes);
+			managedSession.session().execute(command, startupTimeout, maxOutputLines, maxOutputBytes);
+		}
+	}
+
+	private ManagedShellSession resolveManagedSession(RunnableConfig config) {
+		ManagedShellSession contextSession = sessionFromContext(config);
+		if (contextSession != null && contextSession.session() != null) {
+			if (contextSession.isAlive()) {
+				return contextSession;
+			}
+			doCleanup(config, contextSession);
+		}
+
+		ManagedShellSession trackedSession = trackedSession(config);
+		if (trackedSession == null || trackedSession.session() == null) {
+			return null;
+		}
+		if (!trackedSession.isAlive()) {
+			doCleanup(config, trackedSession);
+			return null;
+		}
+
+		attachToContext(config, trackedSession);
+		return trackedSession;
+	}
+
+	private ManagedShellSession sessionFromContext(RunnableConfig config) {
+		ShellSession session = (ShellSession) config.context().get(SESSION_INSTANCE_CONTEXT_KEY);
+		Path sessionPath = (Path) config.context().get(SESSION_PATH_CONTEXT_KEY);
+		if (session == null && sessionPath == null) {
+			return null;
+		}
+		return new ManagedShellSession(session, sessionPath);
+	}
+
+	private ManagedShellSession trackedSession(RunnableConfig config) {
+		return config.threadId().map(trackedSessions::get).orElse(null);
+	}
+
+	private void trackSession(RunnableConfig config, ManagedShellSession managedSession) {
+		config.threadId().ifPresent(threadId -> trackedSessions.put(threadId, managedSession));
+	}
+
+	private void removeTrackedSession(RunnableConfig config, ManagedShellSession managedSession) {
+		config.threadId().ifPresent(threadId ->
+			trackedSessions.computeIfPresent(threadId,
+				(key, existing) -> existing.session() == managedSession.session() ? null : existing));
+	}
+
+	private void attachToContext(RunnableConfig config, ManagedShellSession managedSession) {
+		config.context().put(SESSION_INSTANCE_CONTEXT_KEY, managedSession.session());
+		if (managedSession.sessionPath() != null) {
+			config.context().put(SESSION_PATH_CONTEXT_KEY, managedSession.sessionPath());
+		} else {
+			config.context().remove(SESSION_PATH_CONTEXT_KEY);
+		}
+	}
+
+	private void clearContext(RunnableConfig config) {
+		config.context().remove(SESSION_INSTANCE_CONTEXT_KEY);
+		config.context().remove(SESSION_PATH_CONTEXT_KEY);
+	}
+
+	private void cleanupManagedSession(ManagedShellSession managedSession) {
+		if (managedSession.session() != null) {
+			managedSession.session().stop(terminationTimeout);
+		}
+
+		Path tempDir = managedSession.sessionPath();
+		if (tempDir != null) {
+			try {
+				deleteDirectory(tempDir);
+			} catch (IOException e) {
+				log.warn("Failed to delete temporary directory: {}", tempDir, e);
+			}
+		}
+	}
+
+	private record ManagedShellSession(ShellSession session, Path sessionPath) {
+		boolean isAlive() {
+			return session != null && session.isAlive();
 		}
 	}
 
@@ -313,6 +412,10 @@ public class ShellSessionManager {
 			} catch (IOException e) {
 				log.debug("Failed to close stdin", e);
 			}
+		}
+
+		boolean isAlive() {
+			return process != null && process.isAlive();
 		}
 
 		CommandResult execute(String command, long timeoutMs, int maxOutputLines, Long maxOutputBytes) {
@@ -672,4 +775,3 @@ public class ShellSessionManager {
 		}
 	}
 }
-
